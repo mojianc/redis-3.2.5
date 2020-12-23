@@ -1097,15 +1097,20 @@ void clusterBlacklistCleanup(void) {
 /* Cleanup the blacklist and add a new node ID to the black list. */
 void clusterBlacklistAddNode(clusterNode *node) {
     dictEntry *de;
+    // 获取node的ID
     sds id = sdsnewlen(node->name,CLUSTER_NAMELEN);
-
+    // 先清理黑名单中过期的节点
     clusterBlacklistCleanup();
+    // 然后将node添加到黑名单中
     if (dictAdd(server.cluster->nodes_black_list,id,NULL) == DICT_OK) {
         /* If the key was added, duplicate the sds string representation of
          * the key for the next lookup. We'll free it at the end. */
+        // 如果添加成功，创建一个id的复制品，以便能够在最后free
         id = sdsdup(id);
     }
+    // 找到指定id的节点
     de = dictFind(server.cluster->nodes_black_list,id);
+    // 为其设置过期时间
     dictSetUnsignedIntegerVal(de,time(NULL)+CLUSTER_BLACKLIST_TTL);
     sdsfree(id);
 }
@@ -3974,42 +3979,48 @@ void clusterCommand(client *c) {
         clusterDoBeforeSleep(CLUSTER_TODO_UPDATE_STATE|CLUSTER_TODO_SAVE_CONFIG);
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"setslot") && c->argc >= 4) {
-        /* SETSLOT 10 MIGRATING <node ID> */
-        /* SETSLOT 10 IMPORTING <node ID> */
-        /* SETSLOT 10 STABLE */
-        /* SETSLOT 10 NODE <node ID> */
+        /* SETSLOT 10 MIGRATING <node ID>   设置10号槽处于MIGRATING状态，迁移到<node ID>指定的节点*/
+        /* SETSLOT 10 IMPORTING <node ID>   设置10号槽处于IMPORTING状态，将<node ID>指定的节点的槽导入到myself中*/
+        /* SETSLOT 10 STABLE                取消10号槽的MIGRATING/IMPORTING状态*/
+        /* SETSLOT 10 NODE <node ID>        将10号槽绑定到NODE节点上*/
         int slot;
         clusterNode *n;
-
+        // 如果myself节点是从节点，回复错误信息
         if (nodeIsSlave(myself)) {
             addReplyError(c,"Please use SETSLOT only with masters.");
             return;
         }
-
+        // 获取槽号
         if ((slot = getSlotOrReply(c,c->argv[2])) == -1) return;
 
         if (!strcasecmp(c->argv[3]->ptr,"migrating") && c->argc == 5) {
+            // 如果该槽不是myself主节点负责，那么就不能进行迁移
             if (server.cluster->slots[slot] != myself) {
                 addReplyErrorFormat(c,"I'm not the owner of hash slot %u",slot);
                 return;
             }
+            // 获取迁移的目标节点
             if ((n = clusterLookupNode(c->argv[4]->ptr)) == NULL) {
                 addReplyErrorFormat(c,"I don't know about node %s",
                     (char*)c->argv[4]->ptr);
                 return;
             }
+            // 为该槽设置迁移的目标
             server.cluster->migrating_slots_to[slot] = n;
         } else if (!strcasecmp(c->argv[3]->ptr,"importing") && c->argc == 5) {
+            // 如果该槽已经是myself节点负责，那么不进行导入
             if (server.cluster->slots[slot] == myself) {
                 addReplyErrorFormat(c,
                     "I'm already the owner of hash slot %u",slot);
                 return;
             }
+            // 获取导入的目标节点
             if ((n = clusterLookupNode(c->argv[4]->ptr)) == NULL) {
                 addReplyErrorFormat(c,"I don't know about node %s",
                     (char*)c->argv[3]->ptr);
                 return;
             }
+            // 为该槽设置导入目标
             server.cluster->importing_slots_from[slot] = n;
         } else if (!strcasecmp(c->argv[3]->ptr,"stable") && c->argc == 4) {
             /* CLUSTER SETSLOT <SLOT> STABLE */
@@ -4017,8 +4028,9 @@ void clusterCommand(client *c) {
             server.cluster->migrating_slots_to[slot] = NULL;
         } else if (!strcasecmp(c->argv[3]->ptr,"node") && c->argc == 5) {
             /* CLUSTER SETSLOT <SLOT> NODE <NODE ID> */
+            // 查找到目标节点
             clusterNode *n = clusterLookupNode(c->argv[4]->ptr);
-
+            // 目标节点不存在，回复错误信息
             if (!n) {
                 addReplyErrorFormat(c,"Unknown node %s",
                     (char*)c->argv[4]->ptr);
@@ -4026,7 +4038,9 @@ void clusterCommand(client *c) {
             }
             /* If this hash slot was served by 'myself' before to switch
              * make sure there are no longer local keys for this hash slot. */
+            // 如果这个槽已经由myself节点负责，但是目标节点不是myself节点
             if (server.cluster->slots[slot] == myself && n != myself) {
+                // 保证该槽中没有键，否则不能指定给其他节点
                 if (countKeysInSlot(slot) != 0) {
                     addReplyErrorFormat(c,
                         "Can't assign hashslot %d to a different node "
@@ -4037,12 +4051,15 @@ void clusterCommand(client *c) {
             /* If this slot is in migrating status but we have no keys
              * for it assigning the slot to another node will clear
              * the migratig status. */
+            // 该槽处于被迁移的状态但是该槽中没有键
             if (countKeysInSlot(slot) == 0 &&
                 server.cluster->migrating_slots_to[slot])
+                // 取消迁移的状态
                 server.cluster->migrating_slots_to[slot] = NULL;
 
             /* If this node was importing this slot, assigning the slot to
              * itself also clears the importing status. */
+            // 如果该槽处于导入状态，且目标节点是myself节点
             if (n == myself &&
                 server.cluster->importing_slots_from[slot])
             {
@@ -4055,19 +4072,24 @@ void clusterCommand(client *c) {
                  * failover happens at the same time we close the slot, the
                  * configEpoch collision resolution will fix it assigning
                  * a different epoch to each node. */
+                // 手动迁移该槽，将该节点的配置纪元设置为一个新的纪元，以便集群可以传播新的版本。
+                // 注意，如果这导致与另一个获得相同配置纪元的节点冲突，例如因为取消槽的同时发生执行故障转移的操作，则配置纪元冲突的解决将修复它，指定不同节点有一个不同的纪元。
                 if (clusterBumpConfigEpochWithoutConsensus() == C_OK) {
                     serverLog(LL_WARNING,
                         "configEpoch updated after importing slot %d", slot);
                 }
+                // 取消槽的导入状态
                 server.cluster->importing_slots_from[slot] = NULL;
             }
             clusterDelSlot(slot);
+            // 将slot槽指定给n节点
             clusterAddSlot(n,slot);
         } else {
             addReplyError(c,
                 "Invalid CLUSTER SETSLOT action or number of arguments");
             return;
         }
+        // 更新集群状态和保存配置
         clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|CLUSTER_TODO_UPDATE_STATE);
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"bumpepoch") && c->argc == 2) {
@@ -4158,38 +4180,49 @@ void clusterCommand(client *c) {
         long long maxkeys, slot;
         unsigned int numkeys, j;
         robj **keys;
-
+        // 获取槽号
         if (getLongLongFromObjectOrReply(c,c->argv[2],&slot,NULL) != C_OK)
             return;
+        // 获取打印键的个数
         if (getLongLongFromObjectOrReply(c,c->argv[3],&maxkeys,NULL)
             != C_OK)
             return;
+        // 判断槽号和个数是否非法
         if (slot < 0 || slot >= CLUSTER_SLOTS || maxkeys < 0) {
             addReplyError(c,"Invalid slot or number of keys");
             return;
         }
-
+        // 分配保存键的空间
         keys = zmalloc(sizeof(robj*)*maxkeys);
+        // 将count个键保存到数组中
         numkeys = getKeysInSlot(slot, keys, maxkeys);
+        // 添加回复键的个数
         addReplyMultiBulkLen(c,numkeys);
+        // 添加回复每一个键
         for (j = 0; j < numkeys; j++) addReplyBulk(c,keys[j]);
         zfree(keys);
     } else if (!strcasecmp(c->argv[1]->ptr,"forget") && c->argc == 3) {
         /* CLUSTER FORGET <NODE ID> */
+        // 根据<NODE ID>查找节点ilil
         clusterNode *n = clusterLookupNode(c->argv[2]->ptr);
-
+        // 没找到
         if (!n) {
             addReplyErrorFormat(c,"Unknown node %s", (char*)c->argv[2]->ptr);
             return;
+        // 不能删除myself
         } else if (n == myself) {
             addReplyError(c,"I tried hard but I can't forget myself...");
             return;
+        // 如果myself是从节点，且myself节点的主节点是被删除的目标键，回复错误信息
         } else if (nodeIsSlave(myself) && myself->slaveof == n) {
             addReplyError(c,"Can't forget my master!");
             return;
         }
+        // 将n添加到黑名单中
         clusterBlacklistAddNode(n);
+        // 从集群中删除该节点
         clusterDelNode(n);
+        // 更新状态和保存配置
         clusterDoBeforeSleep(CLUSTER_TODO_UPDATE_STATE|
                              CLUSTER_TODO_SAVE_CONFIG);
         addReply(c,shared.ok);
@@ -4476,6 +4509,7 @@ void restoreCommand(client *c) {
     robj *obj;
 
     /* Parse additional options */
+    // 解析REPLACE选项，如果指定了该选项，设置replace标识
     for (j = 4; j < c->argc; j++) {
         if (!strcasecmp(c->argv[j]->ptr,"replace")) {
             replace = 1;
@@ -4486,12 +4520,14 @@ void restoreCommand(client *c) {
     }
 
     /* Make sure this key does not already exist here... */
+    // 如果没有指定替换标识，但是键存在，回复一个错误
     if (!replace && lookupKeyWrite(c->db,c->argv[1]) != NULL) {
         addReply(c,shared.busykeyerr);
         return;
     }
 
     /* Check if the TTL value makes sense */
+    // 获取生存时间
     if (getLongLongFromObjectOrReply(c,c->argv[2],&ttl,NULL) != C_OK) {
         return;
     } else if (ttl < 0) {
@@ -4500,13 +4536,15 @@ void restoreCommand(client *c) {
     }
 
     /* Verify RDB version and data checksum. */
+    // 验证RDB版本和数据校验和
     if (verifyDumpPayload(c->argv[3]->ptr,sdslen(c->argv[3]->ptr)) == C_ERR)
     {
         addReplyError(c,"DUMP payload version or checksum are wrong");
         return;
     }
-
+    // 初始化缓冲区对象payload并设置缓冲区的地址，读出了序列化数据到缓冲区中
     rioInitWithBuffer(&payload,c->argv[3]->ptr);
+    // 类型错误
     if (((type = rdbLoadObjectType(&payload)) == -1) ||
         ((obj = rdbLoadObject(type,&payload)) == NULL))
     {
@@ -4515,10 +4553,13 @@ void restoreCommand(client *c) {
     }
 
     /* Remove the old key if needed. */
+    // 如果指定了替代的标识，那么删除旧的键
     if (replace) dbDelete(c->db,c->argv[1]);
 
     /* Create the key and set the TTL if any */
+    // 添加键值对到数据库中
     dbAdd(c->db,c->argv[1],obj);
+    // 设置生存时间
     if (ttl) setExpire(c->db,c->argv[1],mstime()+ttl);
     signalModifiedKey(c->db,c->argv[1]);
     addReply(c,shared.ok);
@@ -4531,12 +4572,17 @@ void restoreCommand(client *c) {
  * to this instance in recent time.
  * This sockets are closed when the max number we cache is reached, and also
  * in serverCron() when they are around for more than a few seconds. */
+// 最大的缓存数
 #define MIGRATE_SOCKET_CACHE_ITEMS 64 /* max num of items in the cache. */
+// 缓存连接的生存时间10s
 #define MIGRATE_SOCKET_CACHE_TTL 10 /* close cached sockets after 10 sec. */
 
 typedef struct migrateCachedSocket {
+    // TCP套接字
     int fd;
+    // 上一次还原键的数据库ID
     long last_dbid;
+    // 上一次使用的时间
     time_t last_use_time;
 } migrateCachedSocket;
 
@@ -4670,19 +4716,26 @@ void migrateCommand(client *c) {
     ttl = 0;
 
     /* Parse additional options */
+    // 解析附加项
     for (j = 6; j < c->argc; j++) {
+        // copy项：不删除源节点上的key
         if (!strcasecmp(c->argv[j]->ptr,"copy")) {
             copy = 1;
+        // replace项：替换目标节点上已存在的key
         } else if (!strcasecmp(c->argv[j]->ptr,"replace")) {
             replace = 1;
+        // keys项：指定多个迁移的键
         } else if (!strcasecmp(c->argv[j]->ptr,"keys")) {
+            // 第三个参数必须是空字符串""
             if (sdslen(c->argv[3]->ptr) != 0) {
                 addReplyError(c,
                     "When using MIGRATE KEYS option, the key argument"
                     " must be set to the empty string");
                 return;
             }
+            // 指定要迁移的键，第一个键的下标
             first_key = j+1;
+            // 键的个数
             num_keys = c->argc - j - 1;
             break; /* All the remaining args are keys. */
         } else {
@@ -4692,6 +4745,7 @@ void migrateCommand(client *c) {
     }
 
     /* Sanity check */
+    // 参数有效性检查
     if (getLongFromObjectOrReply(c,c->argv[5],&timeout,NULL) != C_OK ||
         getLongFromObjectOrReply(c,c->argv[4],&dbid,NULL) != C_OK)
     {
@@ -4704,17 +4758,22 @@ void migrateCommand(client *c) {
      * the caller there was nothing to migrate. We don't return an error in
      * this case, since often this is due to a normal condition like the key
      * expiring in the meantime. */
+    // 检查key是否存在，至少有一个key要迁移，否则如果所有的key都不存在，回复一个"NOKEY"通知调用者，没有要迁移的键
     ov = zrealloc(ov,sizeof(robj*)*num_keys);
     kv = zrealloc(kv,sizeof(robj*)*num_keys);
     int oi = 0;
-
+    // 遍历所有指定的键
     for (j = 0; j < num_keys; j++) {
+        // 以读操作取出key的值对象，保存在ov中
         if ((ov[oi] = lookupKeyRead(c->db,c->argv[first_key+j])) != NULL) {
+            // 将存在的key保存到kv中
             kv[oi] = c->argv[first_key+j];
+            // 计数存在的键的个数
             oi++;
         }
     }
     num_keys = oi;
+    // 没有键存在，迁移失败，返回"+NOKEY"
     if (num_keys == 0) {
         zfree(ov); zfree(kv);
         addReplySds(c,sdsnew("+NOKEY\r\n"));
@@ -4725,16 +4784,19 @@ try_again:
     write_error = 0;
 
     /* Connect */
+    // 返回一个包含连接目标实例的TCP套接字的migrateCachedSocket结构，有可能返回一个缓存套接字
     cs = migrateGetSocket(c,c->argv[1],c->argv[2],timeout);
     if (cs == NULL) {
         zfree(ov); zfree(kv);
         return; /* error sent to the client by migrateGetSocket() */
     }
-
+    // 初始化缓冲区对象cmd，用来构建SELECT命令
     rioInitWithBuffer(&cmd,sdsempty());
 
     /* Send the SELECT command if the current DB is not already selected. */
+    // 创建一个SELECT命令，如果上一次要还原到的数据库ID和这次的不相同
     int select = cs->last_dbid != dbid; /* Should we emit SELECT? */
+    // 则需要创建一个SELECT命令
     if (select) {
         serverAssertWithInfo(c,NULL,rioWriteBulkCount(&cmd,'*',2));
         serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,"SELECT",6));
@@ -4742,26 +4804,39 @@ try_again:
     }
 
     /* Create RESTORE payload and generate the protocol to call the command. */
+    // 将所有的键值对进行加工
     for (j = 0; j < num_keys; j++) {
+        // 获取当前key的过期时间
         expireat = getExpire(c->db,kv[j]);
         if (expireat != -1) {
+            // 计算key的生存时间
             ttl = expireat-mstime();
             if (ttl < 1) ttl = 1;
         }
+        // 以"*<count>\r\n"格式为写如一个int整型的count
+        // 如果指定了replace，则count值为5，否则为4
+        // 写回复的个数
         serverAssertWithInfo(c,NULL,rioWriteBulkCount(&cmd,'*',replace ? 5 : 4));
+        // 如果运行在进群模式下，写回复一个"RESTORE-ASKING"
         if (server.cluster_enabled)
             serverAssertWithInfo(c,NULL,
                 rioWriteBulkString(&cmd,"RESTORE-ASKING",14));
+        // 如果不是集群模式下，则写回复一个"RESTORE"
         else
             serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,"RESTORE",7));
+        // 检测键对象的编码
         serverAssertWithInfo(c,NULL,sdsEncodedObject(kv[j]));
+        // 写回复一个键
         serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,kv[j]->ptr,
                 sdslen(kv[j]->ptr)));
+        // 写回复一个键的生存时间
         serverAssertWithInfo(c,NULL,rioWriteBulkLongLong(&cmd,ttl));
 
         /* Emit the payload argument, that is the serialized object using
          * the DUMP format. */
+        // 将值对象序列化
         createDumpPayload(&payload,ov[j]);
+        // 将序列化的值对象写到回复中
         serverAssertWithInfo(c,NULL,
             rioWriteBulkString(&cmd,payload.io.buffer.ptr,
                                sdslen(payload.io.buffer.ptr)));
@@ -4769,6 +4844,7 @@ try_again:
 
         /* Add the REPLACE option to the RESTORE command if it was specified
          * as a MIGRATE option. */
+        // 如果指定了replace，还要写回复一个REPLACE选项
         if (replace)
             serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,"REPLACE",7));
     }
@@ -4779,39 +4855,46 @@ try_again:
         sds buf = cmd.io.buffer.ptr;
         size_t pos = 0, towrite;
         int nwritten = 0;
-
+        // 将rio缓冲区的数据写到TCP套接字中，同步写，如果超过timeout时间，则返回错误
         while ((towrite = sdslen(buf)-pos) > 0) {
+            // 一次写64k大小的数据
             towrite = (towrite > (64*1024) ? (64*1024) : towrite);
             nwritten = syncWrite(cs->fd,buf+pos,towrite,timeout);
             if (nwritten != (signed)towrite) {
                 write_error = 1;
                 goto socket_err;
             }
+            // 记录已写的大小
             pos += nwritten;
         }
     }
-
+    // 读取命令的回复
     char buf1[1024]; /* Select reply. */
     char buf2[1024]; /* Restore reply. */
 
     /* Read the SELECT reply if needed. */
+    // 如果指定了select，读取该命令的回复
     if (select && syncReadLine(cs->fd, buf1, sizeof(buf1), timeout) <= 0)
         goto socket_err;
 
     /* Read the RESTORE replies. */
+    // 读RESTORE的回复
     int error_from_target = 0;
     int socket_error = 0;
     int del_idx = 1; /* Index of the key argument for the replicated DEL op. */
-
+    // 没有指定copy选项，分配一个新的参数列表空间
     if (!copy) newargv = zmalloc(sizeof(robj*)*(num_keys+1));
-
+    // 读取每一个键的回复
     for (j = 0; j < num_keys; j++) {
+        // 同步读取每一个键的回复，超时timeout
         if (syncReadLine(cs->fd, buf2, sizeof(buf2), timeout) <= 0) {
             socket_error = 1;
             break;
         }
+        // 如果指定了select，检查select的回复
         if ((select && buf1[0] == '-') || buf2[0] == '-') {
             /* On error assume that last_dbid is no longer valid. */
+            // 如果select回复错误，那么last_dbid就是无效的了
             if (!error_from_target) {
                 cs->last_dbid = -1;
                 addReplyErrorFormat(c,"Target instance replied with error: %s",
@@ -4819,13 +4902,18 @@ try_again:
                 error_from_target = 1;
             }
         } else {
+            // 没有指定copy选项，要删除源节点的键
             if (!copy) {
                 /* No COPY option: remove the local key, signal the change. */
+                // 删除源节点的键
                 dbDelete(c->db,kv[j]);
+                // 发送信号
                 signalModifiedKey(c->db,kv[j]);
+                // 更新脏键个数
                 server.dirty++;
 
                 /* Populate the argument vector to replace the old one. */
+                // 设置删除键的列表
                 newargv[del_idx++] = kv[j];
                 incrRefCount(kv[j]);
             }
@@ -4835,17 +4923,21 @@ try_again:
     /* On socket error, if we want to retry, do it now before rewriting the
      * command vector. We only retry if we are sure nothing was processed
      * and we failed to read the first reply (j == 0 test). */
+    // 套接字错误，第一个键就错误，可以进行重试
     if (!error_from_target && socket_error && j == 0 && may_retry &&
         errno != ETIMEDOUT)
     {
         goto socket_err; /* A retry is guaranteed because of tested conditions.*/
     }
-
+    // 没有指定copy选项
     if (!copy) {
         /* Translate MIGRATE as DEL for replication/AOF. */
+        // 如果删除了键
         if (del_idx > 1) {
+            // 创建一个DEL命令，用来发送到AOF和从节点中
             newargv[0] = createStringObject("DEL",3);
             /* Note that the following call takes ownership of newargv. */
+            // 用指定的newargv参数列表替代client的参数列表
             replaceClientCommandVector(c,del_idx,newargv);
         } else {
             /* No key transfer acknowledged, no need to rewrite as DEL. */
@@ -4857,21 +4949,23 @@ try_again:
     /* If we are here and a socket error happened, we don't want to retry.
      * Just signal the problem to the client, but only do it if we don't
      * already queued a different error reported by the destination server. */
+    // 执行到这里，如果还没有跳到socket_err，那么关闭重试的标志，跳转到socket_err
     if (!error_from_target && socket_error) {
         may_retry = 0;
         goto socket_err;
     }
-
+    // 不是目标节点的回复错误
     if (!error_from_target) {
         /* Success! Update the last_dbid in migrateCachedSocket, so that we can
          * avoid SELECT the next time if the target DB is the same. Reply +OK. */
+        // 更新最近一次使用的数据库ID
         cs->last_dbid = dbid;
         addReply(c,shared.ok);
     } else {
         /* On error we already sent it in the for loop above, and set
          * the curretly selected socket to -1 to force SELECT the next time. */
     }
-
+    // 释放空间
     sdsfree(cmd.io.buffer.ptr);
     zfree(ov); zfree(kv); zfree(newargv);
     if (socket_error) migrateCloseSocket(c->argv[1],c->argv[2]);
@@ -4883,6 +4977,7 @@ try_again:
 socket_err:
     /* Cleanup we want to perform in both the retry and no retry case.
      * Note: Closing the migrate socket will also force SELECT next time. */
+    // 如果没有重写client参数列表，关闭连接，因为要保持一致性
     sdsfree(cmd.io.buffer.ptr);
     migrateCloseSocket(c->argv[1],c->argv[2]);
     zfree(newargv);
@@ -4890,6 +4985,7 @@ socket_err:
 
     /* Retry only if it's not a timeout and we never attempted a retry
      * (or the code jumping here did not set may_retry to zero). */
+    // 如果可以重试，跳转到try_again
     if (errno != ETIMEDOUT && may_retry) {
         may_retry = 0;
         goto try_again;
