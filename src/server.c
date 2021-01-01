@@ -2523,9 +2523,11 @@ int processCommand(client *c) {
         c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&
         c->cmd->proc != multiCommand && c->cmd->proc != watchCommand)
     {
+        // 除了上述的四个命令，其他的命令添加到事务队列中
         queueMultiCommand(c);
         addReply(c,shared.queued);
     } else {
+        // 执行普通的命令
         call(c,CMD_CALL_FULL);
         c->woff = server.master_repl_offset;
         if (listLength(server.ready_keys))
